@@ -12,7 +12,7 @@ from threading import Thread
 
 # ================= CONFIG =================
 # নিরাপত্তার জন্য টোকেন এনভায়রনমেন্ট থেকে নিন
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8593373295:AAFC9Q37TSdt42DvHmOMswuB-7RW8gcOQQE")  # Default for demo
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8593373295:AAG5KXGqy0lKL1tXZ8z6ZFMm59YD5pEdhIg")  # Default for demo
 BOT_USERNAME = "gmail_farmar_litebot"   # without @
 CHANNEL_USERNAME = "gmail_farmar_lite"    # without @
 PAGE_SIZE = 5
