@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import telebot
 from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -8,107 +9,648 @@ from telebot.types import (
 )
 import firebase_admin
 from firebase_admin import credentials, db
-from threading import Thread
 
 # ================= CONFIG =================
-# নিরাপত্তার জন্য টোকেন এনভায়রনমেন্ট থেকে নিন
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8593373295:AAG5KXGqy0lKL1tXZ8z6ZFMm59YD5pEdhIg")  # Default for demo
-BOT_USERNAME = "gmail_farmar_litebot"   # without @
-CHANNEL_USERNAME = "gmail_farmar_lite"    # without @
-PAGE_SIZE = 5
+BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("ADMIN_BOT_TOKEN environment variable not set")
 
-# ফায়ারবেস কনফিগ (এনভ থেকে DB URL নিতে পারেন)
 FIREBASE_DB_URL = os.getenv("FIREBASE_DB_URL", "https://post-c7e41-default-rtdb.firebaseio.com")
+DEFAULT_PASSWORD = "12457"
+SESSION_TIMEOUT = 3600
+ITEMS_PER_PAGE = 5
 
 # ================= BOT =================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ================= FIREBASE =================
-cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+# ================= FIREBASE INIT =================
+def init_firebase():
+    firebase_cred_json = os.getenv("serviceAccountKey.json")
+    if firebase_cred_json:
+        try:
+            cred_dict = json.loads(firebase_cred_json)
+            cred = credentials.Certificate(cred_dict)
+        except json.JSONDecodeError as e:
+            print(f"❌ Invalid FIREBASE_CRED_JSON format: {e}")
+            raise
+    else:
+        cred = credentials.Certificate("serviceAccountKey.json")
+    firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+    print("✅ Firebase initialized")
 
-# ================= STATES =================
-submit_state = {}       # user_id: {"step": int, "data": dict, "timestamp": int}
-withdraw_state = {}     # user_id: current state string
-withdraw_method = {}    # user_id: selected method
-withdraw_amount = {}    # user_id: amount
-STATE_TIMEOUT = 3600    # 1 hour
+init_firebase()
 
-# ================= STATE CLEANUP THREAD =================
-def cleanup_states():
-    """পুরনো স্টেট মুছে ফেলে (প্রতি ১০ মিনিটে)"""
-    while True:
-        time.sleep(600)  # 10 minutes
-        now = time.time()
-        for uid, state in list(submit_state.items()):
-            if now - state.get("timestamp", 0) > STATE_TIMEOUT:
-                submit_state.pop(uid, None)
-        for uid, state in list(withdraw_state.items()):
-            # withdraw_state ডিকশনারিতে value শুধু string, তাই আমরা আলাদা টাইমস্ট্যাম্প রাখি না
-            # এখানে টাইমস্ট্যাম্প না থাকায় ক্লিনআপ করবো না (পরে চাইলে যোগ করা যাবে)
-            pass
+# ================= SESSION MANAGEMENT =================
+authenticated_users = {}
 
-Thread(target=cleanup_states, daemon=True).start()
+def is_authenticated(user_id):
+    if user_id not in authenticated_users:
+        return False
+    if time.time() - authenticated_users[user_id] > SESSION_TIMEOUT:
+        authenticated_users.pop(user_id, None)
+        return False
+    return True
+
+def authenticate(user_id):
+    authenticated_users[user_id] = time.time()
+
+def require_auth(func):
+    def wrapper(message):
+        if not is_authenticated(message.from_user.id):
+            bot.reply_to(message, "🔐 Please send /start and enter password first.")
+            return
+        return func(message)
+    return wrapper
+
+# ================= PASSWORD MANAGEMENT =================
+def get_admin_password():
+    pwd = db.reference("settings/admin_password").get()
+    return pwd if pwd else DEFAULT_PASSWORD
+
+def set_admin_password(new_password):
+    db.reference("settings/admin_password").set(new_password)
 
 # ================= HELPERS =================
-def is_joined(user_id):
-    try:
-        status = bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id).status
-        return status in ["member", "administrator", "creator"]
-    except:
-        return False
-
-def is_valid_gmail(email):
-    return email.endswith("@gmail.com")
-
-def gmail_exists(gmail):
-    """দ্রুত চেক: gmails/{gmail} পাথে True আছে কিনা"""
-    return db.reference(f"gmails/{gmail}").get() is not None
-
-def mark_gmail_used(gmail):
-    """সাবমিশন সফল হলে gmails পাথে সংরক্ষণ"""
-    db.reference(f"gmails/{gmail}").set(True)
-
-def add_referral_bonus(referrer_id):
-    """রেফারেল বোনাস যোগ করে"""
-    bonus = db.reference("settings/referral_bonus").get() or 0.05
-    try:
-        bonus = float(bonus)
-    except:
-        bonus = 0.05
-    user_ref = db.reference(f"users/{referrer_id}")
-    user_ref.transaction(lambda current: update_balance_transaction(current, bonus, "referral_earned", "total_earned"))
-
-def update_balance_transaction(current, amount, earned_field, total_field):
-    """ট্রানজেকশনে ব্যালেন্স আপডেট"""
+def update_balance_transaction(current, amount, earned_field=None, total_field=None):
     if current is None:
         return
     current["balance"] = current.get("balance", 0.0) + amount
-    current[earned_field] = current.get(earned_field, 0.0) + amount
-    current[total_field] = current.get(total_field, 0.0) + amount
+    if earned_field:
+        current[earned_field] = current.get(earned_field, 0.0) + amount
+    if total_field:
+        current[total_field] = current.get(total_field, 0.0) + amount
     return current
 
 def safe_firebase_operation(func, *args, **kwargs):
-    """এরর হ্যান্ডলিং সহ ফায়ারবেস অপারেশন"""
     try:
         return func(*args, **kwargs)
     except Exception as e:
         print(f"Firebase error: {e}")
         return None
 
-# ================= MENU =================
-def main_menu(chat_id):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("✏️ Submit my own", "💰 Balance")
-    kb.row("💸 Withdraw", "📄 My History")
-    kb.row("📣 Share Referral Link", "🏆 Top Referrals")
-    kb.row("📌 Help")
-    bot.send_message(chat_id, "📌 Main Menu", reply_markup=kb)
+def paginate_items(items_dict, page):
+    items = list(items_dict.items())
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    return items[start:end]
 
-# ================= /START + REFERRAL =================
+# ================= ADMIN MENU =================
+def admin_menu(chat_id):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("📥 Pending Gmail", "💸 Pending Withdraw")
+    kb.row("⚙️ Set Gmail Rate", "🎁 Set Referral Bonus")
+    kb.row("💰 Set Min Withdraw", "🔑 Change Password")
+    kb.row("🔑 Logout")
+    bot.send_message(chat_id, "🛠 Admin Panel", reply_markup=kb)
+
+# ================= AUTHENTICATION FLOW =================
 @bot.message_handler(commands=["start"])
-def start(message):
-    user_id = str(message.from_user.id)
+def start_auth(message):
+    if is_authenticated(message.from_user.id):
+        admin_menu(message.chat.id)
+        return
+    msg = bot.reply_to(message, "🔐 Enter admin password:")
+    bot.register_next_step_handler(msg, check_password)
+
+def check_password(message):
+    if message.text.strip() == get_admin_password():
+        authenticate(message.from_user.id)
+        bot.send_message(message.chat.id, "✅ Authentication successful!")
+        admin_menu(message.chat.id)
+    else:
+        bot.send_message(message.chat.id, "❌ Wrong password. Use /start to try again.")
+
+@bot.message_handler(func=lambda m: m.text == "🔑 Logout")
+@require_auth
+def logout(message):
+    authenticated_users.pop(message.from_user.id, None)
+    bot.send_message(message.chat.id, "🔒 Logged out. Use /start to login.", reply_markup=ReplyKeyboardRemove())
+
+# ================= CHANGE PASSWORD =================
+@bot.message_handler(func=lambda m: m.text == "🔑 Change Password")
+@require_auth
+def change_password_start(message):
+    msg = bot.send_message(message.chat.id, "✏️ Send new password (min 4 chars):")
+    bot.register_next_step_handler(msg, change_password_set)
+
+def change_password_set(message):
+    new_pwd = message.text.strip()
+    if len(new_pwd) < 4:
+        bot.send_message(message.chat.id, "❌ Password too short. Try again.")
+        return
+    set_admin_password(new_pwd)
+    bot.send_message(message.chat.id, f"✅ Password changed to: `{new_pwd}`\nPlease login again.", parse_mode="Markdown")
+    authenticated_users.pop(message.from_user.id, None)
+
+# ================= PENDING GMAIL (USER GROUP) =================
+@bot.message_handler(func=lambda m: m.text == "📥 Pending Gmail")
+@require_auth
+def btn_pending_gmail(m):
+    send_user_list_page(m.chat.id, 0)
+
+def send_user_list_page(chat_id, page):
+    subs = safe_firebase_operation(db.reference("submissions").get)
+    if not subs:
+        bot.send_message(chat_id, "📭 No pending submissions.")
+        return
+    pending = {sid: s for sid, s in subs.items() if s.get("status") == "pending"}
+    if not pending:
+        bot.send_message(chat_id, "📭 No pending submissions.")
+        return
+
+    users = {}
+    for sid, s in pending.items():
+        uid = s.get("user_id")
+        users.setdefault(uid, []).append((sid, s))
+    user_items = list(users.items())
+
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    for uid, subs_list in user_items[start:end]:
+        name = subs_list[0][1].get("name", "Unknown")
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(name, callback_data=f"showg_{uid}_0"))
+        bot.send_message(chat_id, f"👤 {name}", reply_markup=kb)
+
+    kb_page = InlineKeyboardMarkup()
+    if page > 0:
+        kb_page.add(InlineKeyboardButton("⬅️ Prev", callback_data=f"userp_{page-1}"))
+    if end < len(user_items):
+        kb_page.add(InlineKeyboardButton("➡️ Next", callback_data=f"userp_{page+1}"))
+    if kb_page.keyboard:
+        bot.send_message(chat_id, f"📄 Page {page+1}", reply_markup=kb_page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("userp_"))
+def user_list_pagination(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    page = int(call.data.split("_")[1])
+    send_user_list_page(call.message.chat.id, page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("showg_"))
+def show_user_gmails(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    _, uid, page = call.data.split("_")
+    page = int(page)
+    subs = safe_firebase_operation(db.reference("submissions").get)
+    if not subs:
+        bot.answer_callback_query(call.id, "No data")
+        return
+    user_pending = [(sid, s) for sid, s in subs.items() if s.get("status") == "pending" and str(s.get("user_id")) == uid]
+    if not user_pending:
+        bot.answer_callback_query(call.id, "No pending Gmail for this user")
+        return
+
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    for sid, s in user_pending[start:end]:
+        text = (
+            f"📩 Gmail Submission\n\n"
+            f"📧 {s.get('gmail')}\n🔑 {s.get('password')}\n📨 Recovery: {s.get('recovery')}\n"
+            f"👤 {s.get('name', 'N/A')}\n🆔 {s.get('user_id')}"
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(
+            InlineKeyboardButton("✅ Approve", callback_data=f"ga_{sid}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"gr_{sid}")
+        )
+        bot.send_message(call.message.chat.id, text, reply_markup=kb)
+
+    kb_page = InlineKeyboardMarkup()
+    if page > 0:
+        kb_page.add(InlineKeyboardButton("⬅️ Prev", callback_data=f"showg_{uid}_{page-1}"))
+    if end < len(user_pending):
+        kb_page.add(InlineKeyboardButton("➡️ Next", callback_data=f"showg_{uid}_{page+1}"))
+    if kb_page.keyboard:
+        bot.send_message(call.message.chat.id, f"📄 Page {page+1}", reply_markup=kb_page)
+
+# ================= GMAIL APPROVE / REJECT =================
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("ga_", "gr_")))
+def handle_gmail_approval(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    action, sid = call.data.split("_")
+    sub_ref = db.reference(f"submissions/{sid}")
+    sub = sub_ref.get()
+    if not sub or sub.get("status") != "pending":
+        bot.answer_callback_query(call.id, "Already processed")
+        return
+    user_id = sub["user_id"]
+    if action == "ga":
+        rate = safe_firebase_operation(db.reference("settings/gmail_rate").get) or 0.15
+        db.reference(f"users/{user_id}").transaction(lambda cur: update_balance_transaction(cur, rate, "balance", "total_earned"))
+        sub_ref.update({"status": "approved"})
+        bot.answer_callback_query(call.id, "✅ Approved")
+        try:
+            bot.send_message(user_id, f"✅ Your Gmail approved! +{rate} USDT added.")
+        except:
+            pass
+    else:
+        sub_ref.update({"status": "rejected"})
+        bot.answer_callback_query(call.id, "❌ Rejected")
+        try:
+            bot.send_message(user_id, "❌ Your Gmail was rejected.")
+        except:
+            pass
+    # Update user history
+    db.reference(f"user_submissions/{user_id}/{sid}").set({
+        "gmail": sub.get("gmail"),
+        "password": sub.get("password"),
+        "recovery": sub.get("recovery"),
+        "status": sub_ref.get().get("status"),
+        "timestamp": sub.get("timestamp", time.time())
+    })
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except:
+        pass
+
+# ================= PENDING WITHDRAW =================
+@bot.message_handler(func=lambda m: m.text == "💸 Pending Withdraw")
+@require_auth
+def btn_pending_withdraw(m):
+    send_withdraw_page(m.chat.id, 0)
+
+def send_withdraw_page(chat_id, page):
+    reqs = safe_firebase_operation(db.reference("withdraw_requests").order_by_child("status").equal_to("pending").get)
+    if not reqs:
+        bot.send_message(chat_id, "📭 No pending withdraw requests.")
+        return
+    items = paginate_items(reqs, page)
+    for rid, req in items:
+        text = (
+            f"💸 Withdraw Request\n"
+            f"User: {req.get('user_id')}\n"
+            f"Amount: {req.get('amount')} USDT\n"
+            f"Method: {req.get('method')}\n"
+            f"Address: {req.get('address')}"
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(
+            InlineKeyboardButton("✅ Approve", callback_data=f"wa_{rid}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"wr_{rid}")
+        )
+        bot.send_message(chat_id, text, reply_markup=kb)
+    kb_page = InlineKeyboardMarkup()
+    if page > 0:
+        kb_page.add(InlineKeyboardButton("⬅️ Prev", callback_data=f"wp_{page-1}"))
+    if (page+1)*ITEMS_PER_PAGE < len(reqs):
+        kb_page.add(InlineKeyboardButton("➡️ Next", callback_data=f"wp_{page+1}"))
+    if kb_page.keyboard:
+        bot.send_message(chat_id, f"📄 Page {page+1}", reply_markup=kb_page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("wp_"))
+def withdraw_pagination(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    page = int(call.data.split("_")[1])
+    send_withdraw_page(call.message.chat.id, page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("wa_", "wr_")))
+def handle_withdraw(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    action, rid = call.data.split("_")
+    req_ref = db.reference(f"withdraw_requests/{rid}")
+    req = req_ref.get()
+    if not req or req.get("status") != "pending":
+        bot.answer_callback_query(call.id, "Already processed")
+        return
+    user_id = req["user_id"]
+    if action == "wa":
+        req_ref.update({"status": "completed"})
+        bot.answer_callback_query(call.id, "✅ Completed")
+        try:
+            bot.send_message(user_id, f"✅ Withdraw of {req['amount']} USDT completed.")
+        except:
+            pass
+    else:
+        # refund
+        db.reference(f"users/{user_id}").transaction(lambda cur: update_balance_transaction(cur, req['amount'], None, None))
+        req_ref.update({"status": "rejected"})
+        bot.answer_callback_query(call.id, "❌ Rejected (balance refunded)")
+        try:
+            bot.send_message(user_id, f"❌ Withdraw rejected. {req['amount']} USDT refunded.")
+        except:
+            pass
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except:
+        pass
+
+# ================= SETTINGS =================
+settings_state = {}
+@bot.message_handler(func=lambda m: m.text in ["⚙️ Set Gmail Rate", "🎁 Set Referral Bonus", "💰 Set Min Withdraw"])
+@require_auth
+def btn_settings(m):
+    if m.text == "⚙️ Set Gmail Rate":
+        settings_state[m.from_user.id] = "rate"
+        bot.send_message(m.chat.id, "✏️ New Gmail rate (e.g., 0.15):")
+    elif m.text == "🎁 Set Referral Bonus":
+        settings_state[m.from_user.id] = "ref"
+        bot.send_message(m.chat.id, "✏️ New referral bonus (e.g., 0.05):")
+    else:
+        settings_state[m.from_user.id] = "min"
+        bot.send_message(m.chat.id, "✏️ New minimum withdraw (e.g., 2.0):")
+
+@bot.message_handler(func=lambda m: m.from_user.id in settings_state)
+def set_value(m):
+    state = settings_state.pop(m.from_user.id)
+    try:
+        val = float(m.text)
+        if state == "rate":
+            db.reference("settings/gmail_rate").set(val)
+            bot.send_message(m.chat.id, f"✅ Gmail rate set to {val} USDT")
+        elif state == "ref":
+            db.reference("settings/referral_bonus").set(val)
+            bot.send_message(m.chat.id, f"✅ Referral bonus set to {val} USDT")
+        elif state == "min":
+            db.reference("settings/min_withdraw").set(val)
+            bot.send_message(m.chat.id, f"✅ Min withdraw set to {val} USDT")
+    except:
+        bot.send_message(m.chat.id, "❌ Invalid number. Try again.")
+
+# ================= RUN =================
+if __name__ == "__main__":
+    print("Admin bot running...")
+    bot.infinity_polling()        return
+    msg = bot.reply_to(message, "🔐 Enter admin password:")
+    bot.register_next_step_handler(msg, check_password)
+
+def check_password(message):
+    if message.text.strip() == get_admin_password():
+        authenticate(message.from_user.id)
+        bot.send_message(message.chat.id, "✅ Authentication successful!")
+        admin_menu(message.chat.id)
+    else:
+        bot.send_message(message.chat.id, "❌ Wrong password. Use /start to try again.")
+
+@bot.message_handler(func=lambda m: m.text == "🔑 Logout")
+@require_auth
+def logout(message):
+    authenticated_users.pop(message.from_user.id, None)
+    bot.send_message(message.chat.id, "🔒 Logged out. Use /start to login.", reply_markup=ReplyKeyboardRemove())
+
+# ================= CHANGE PASSWORD =================
+@bot.message_handler(func=lambda m: m.text == "🔑 Change Password")
+@require_auth
+def change_password_start(message):
+    msg = bot.send_message(message.chat.id, "✏️ Send new password (min 4 chars):")
+    bot.register_next_step_handler(msg, change_password_set)
+
+def change_password_set(message):
+    new_pwd = message.text.strip()
+    if len(new_pwd) < 4:
+        bot.send_message(message.chat.id, "❌ Password too short. Try again.")
+        return
+    set_admin_password(new_pwd)
+    bot.send_message(message.chat.id, f"✅ Password changed to: `{new_pwd}`\nPlease login again.", parse_mode="Markdown")
+    authenticated_users.pop(message.from_user.id, None)
+
+# ================= PENDING GMAIL (USER GROUP) =================
+@bot.message_handler(func=lambda m: m.text == "📥 Pending Gmail")
+@require_auth
+def btn_pending_gmail(m):
+    send_user_list_page(m.chat.id, 0)
+
+def send_user_list_page(chat_id, page):
+    subs = safe_firebase_operation(db.reference("submissions").get)
+    if not subs:
+        bot.send_message(chat_id, "📭 No pending submissions.")
+        return
+    pending = {sid: s for sid, s in subs.items() if s.get("status") == "pending"}
+    if not pending:
+        bot.send_message(chat_id, "📭 No pending submissions.")
+        return
+
+    users = {}
+    for sid, s in pending.items():
+        uid = s.get("user_id")
+        users.setdefault(uid, []).append((sid, s))
+    user_items = list(users.items())
+
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    for uid, subs_list in user_items[start:end]:
+        name = subs_list[0][1].get("name", "Unknown")
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(name, callback_data=f"showg_{uid}_0"))
+        bot.send_message(chat_id, f"👤 {name}", reply_markup=kb)
+
+    kb_page = InlineKeyboardMarkup()
+    if page > 0:
+        kb_page.add(InlineKeyboardButton("⬅️ Prev", callback_data=f"userp_{page-1}"))
+    if end < len(user_items):
+        kb_page.add(InlineKeyboardButton("➡️ Next", callback_data=f"userp_{page+1}"))
+    if kb_page.keyboard:
+        bot.send_message(chat_id, f"📄 Page {page+1}", reply_markup=kb_page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("userp_"))
+def user_list_pagination(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    page = int(call.data.split("_")[1])
+    send_user_list_page(call.message.chat.id, page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("showg_"))
+def show_user_gmails(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    _, uid, page = call.data.split("_")
+    page = int(page)
+    subs = safe_firebase_operation(db.reference("submissions").get)
+    if not subs:
+        bot.answer_callback_query(call.id, "No data")
+        return
+    user_pending = [(sid, s) for sid, s in subs.items() if s.get("status") == "pending" and str(s.get("user_id")) == uid]
+    if not user_pending:
+        bot.answer_callback_query(call.id, "No pending Gmail for this user")
+        return
+
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    for sid, s in user_pending[start:end]:
+        text = (
+            f"📩 Gmail Submission\n\n"
+            f"📧 {s.get('gmail')}\n🔑 {s.get('password')}\n📨 Recovery: {s.get('recovery')}\n"
+            f"👤 {s.get('name', 'N/A')}\n🆔 {s.get('user_id')}"
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(
+            InlineKeyboardButton("✅ Approve", callback_data=f"ga_{sid}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"gr_{sid}")
+        )
+        bot.send_message(call.message.chat.id, text, reply_markup=kb)
+
+    kb_page = InlineKeyboardMarkup()
+    if page > 0:
+        kb_page.add(InlineKeyboardButton("⬅️ Prev", callback_data=f"showg_{uid}_{page-1}"))
+    if end < len(user_pending):
+        kb_page.add(InlineKeyboardButton("➡️ Next", callback_data=f"showg_{uid}_{page+1}"))
+    if kb_page.keyboard:
+        bot.send_message(call.message.chat.id, f"📄 Page {page+1}", reply_markup=kb_page)
+
+# ================= GMAIL APPROVE / REJECT =================
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("ga_", "gr_")))
+def handle_gmail_approval(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    action, sid = call.data.split("_")
+    sub_ref = db.reference(f"submissions/{sid}")
+    sub = sub_ref.get()
+    if not sub or sub.get("status") != "pending":
+        bot.answer_callback_query(call.id, "Already processed")
+        return
+    user_id = sub["user_id"]
+    if action == "ga":
+        rate = safe_firebase_operation(db.reference("settings/gmail_rate").get) or 0.15
+        db.reference(f"users/{user_id}").transaction(lambda cur: update_balance_transaction(cur, rate, "balance", "total_earned"))
+        sub_ref.update({"status": "approved"})
+        bot.answer_callback_query(call.id, "✅ Approved")
+        try:
+            bot.send_message(user_id, f"✅ Your Gmail approved! +{rate} USDT added.")
+        except:
+            pass
+    else:
+        sub_ref.update({"status": "rejected"})
+        bot.answer_callback_query(call.id, "❌ Rejected")
+        try:
+            bot.send_message(user_id, "❌ Your Gmail was rejected.")
+        except:
+            pass
+    # Update user history
+    db.reference(f"user_submissions/{user_id}/{sid}").set({
+        "gmail": sub.get("gmail"),
+        "password": sub.get("password"),
+        "recovery": sub.get("recovery"),
+        "status": sub_ref.get().get("status"),
+        "timestamp": sub.get("timestamp", time.time())
+    })
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except:
+        pass
+
+# ================= PENDING WITHDRAW =================
+@bot.message_handler(func=lambda m: m.text == "💸 Pending Withdraw")
+@require_auth
+def btn_pending_withdraw(m):
+    send_withdraw_page(m.chat.id, 0)
+
+def send_withdraw_page(chat_id, page):
+    reqs = safe_firebase_operation(db.reference("withdraw_requests").order_by_child("status").equal_to("pending").get)
+    if not reqs:
+        bot.send_message(chat_id, "📭 No pending withdraw requests.")
+        return
+    items = paginate_items(reqs, page)
+    for rid, req in items:
+        text = (
+            f"💸 Withdraw Request\n"
+            f"User: {req.get('user_id')}\n"
+            f"Amount: {req.get('amount')} USDT\n"
+            f"Method: {req.get('method')}\n"
+            f"Address: {req.get('address')}"
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(
+            InlineKeyboardButton("✅ Approve", callback_data=f"wa_{rid}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"wr_{rid}")
+        )
+        bot.send_message(chat_id, text, reply_markup=kb)
+    kb_page = InlineKeyboardMarkup()
+    if page > 0:
+        kb_page.add(InlineKeyboardButton("⬅️ Prev", callback_data=f"wp_{page-1}"))
+    if (page+1)*ITEMS_PER_PAGE < len(reqs):
+        kb_page.add(InlineKeyboardButton("➡️ Next", callback_data=f"wp_{page+1}"))
+    if kb_page.keyboard:
+        bot.send_message(chat_id, f"📄 Page {page+1}", reply_markup=kb_page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("wp_"))
+def withdraw_pagination(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    page = int(call.data.split("_")[1])
+    send_withdraw_page(call.message.chat.id, page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("wa_", "wr_")))
+def handle_withdraw(call):
+    if not is_authenticated(call.from_user.id):
+        bot.answer_callback_query(call.id, "Login required")
+        return
+    action, rid = call.data.split("_")
+    req_ref = db.reference(f"withdraw_requests/{rid}")
+    req = req_ref.get()
+    if not req or req.get("status") != "pending":
+        bot.answer_callback_query(call.id, "Already processed")
+        return
+    user_id = req["user_id"]
+    if action == "wa":
+        req_ref.update({"status": "completed"})
+        bot.answer_callback_query(call.id, "✅ Completed")
+        try:
+            bot.send_message(user_id, f"✅ Withdraw of {req['amount']} USDT completed.")
+        except:
+            pass
+    else:
+        # refund
+        db.reference(f"users/{user_id}").transaction(lambda cur: update_balance_transaction(cur, req['amount'], None, None))
+        req_ref.update({"status": "rejected"})
+        bot.answer_callback_query(call.id, "❌ Rejected (balance refunded)")
+        try:
+            bot.send_message(user_id, f"❌ Withdraw rejected. {req['amount']} USDT refunded.")
+        except:
+            pass
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except:
+        pass
+
+# ================= SETTINGS =================
+settings_state = {}
+@bot.message_handler(func=lambda m: m.text in ["⚙️ Set Gmail Rate", "🎁 Set Referral Bonus", "💰 Set Min Withdraw"])
+@require_auth
+def btn_settings(m):
+    if m.text == "⚙️ Set Gmail Rate":
+        settings_state[m.from_user.id] = "rate"
+        bot.send_message(m.chat.id, "✏️ New Gmail rate (e.g., 0.15):")
+    elif m.text == "🎁 Set Referral Bonus":
+        settings_state[m.from_user.id] = "ref"
+        bot.send_message(m.chat.id, "✏️ New referral bonus (e.g., 0.05):")
+    else:
+        settings_state[m.from_user.id] = "min"
+        bot.send_message(m.chat.id, "✏️ New minimum withdraw (e.g., 2.0):")
+
+@bot.message_handler(func=lambda m: m.from_user.id in settings_state)
+def set_value(m):
+    state = settings_state.pop(m.from_user.id)
+    try:
+        val = float(m.text)
+        if state == "rate":
+            db.reference("settings/gmail_rate").set(val)
+            bot.send_message(m.chat.id, f"✅ Gmail rate set to {val} USDT")
+        elif state == "ref":
+            db.reference("settings/referral_bonus").set(val)
+            bot.send_message(m.chat.id, f"✅ Referral bonus set to {val} USDT")
+        elif state == "min":
+            db.reference("settings/min_withdraw").set(val)
+            bot.send_message(m.chat.id, f"✅ Min withdraw set to {val} USDT")
+    except:
+        bot.send_message(m.chat.id, "❌ Invalid number. Try again.")
+
+# ================= RUN =================
+if __name__ == "__main__":
+    print("Admin bot running...")
+    bot.infinity_polling()    user_id = str(message.from_user.id)
     args = message.text.split()
     ref_by = args[1] if len(args) > 1 else None
 
